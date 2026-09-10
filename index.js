@@ -6,95 +6,154 @@ const PORT = process.env.PORT || 7000;
  
 const builder = new addonBuilder({
   id: "com.perso.movixcloud",
-  version: "2.0.0",
+  version: "3.1.0",
   name: "MovixCloud Stream",
-  description: "Récupère les flux directs depuis Movix.cloud",
-  resources: ["stream"],
+  description: "Contenu exclusif et flux directs depuis Movix.cloud",
+  resources: ["catalog", "stream"],
   types: ["movie", "series"],
   idPrefixes: ["tt"],
-  catalogs:[]
+  catalogs: [
+    {
+      type: "movie",
+      id: "movix_movies_exclusive",
+      name: "Catalogue Movix - Films"
+    },
+    {
+      type: "series",
+      id: "movix_series_exclusive",
+      name: "Catalogue Movix - Séries"
+    }
+  ]
 });
  
-builder.defineStreamHandler(async (args) => {
-  console.log(`[INFO] Demande reçue : ${args.type} (${args.id})`);
+// 1. CATALOGUE 100% ISSU DE MOVIX.CLOUD
+builder.defineCatalogHandler(async (args) => {
+  console.log(`[CATALOGUE MOVIX] Extraction des contenus depuis le site... (${args.type})`);
  
   try {
-    // 1. Découpage de l'ID Stremio (tt1234567:1:2)
-    const idParts = args.id.split(":");
-    const imdbId = idParts[0];
-    const season = idParts[1] || "1";
-    const episode = idParts[2] || "1";
+    // URL source sur Movix (ex: https://movix.cloud/movies ou https://movix.cloud/tv-shows)
+    const categoryPath = args.type === "movie" ? "movies" : "tv-shows";
+    const movixUrl = `https://movix.cloud/${categoryPath}`;
  
-    // 2. Conversion IMDb -> TMDb ID + Titre via l'API Cinemeta
-    const metaResponse = await axios.get(`https://v3-cinemeta.strem.fun/meta/${args.type}/${imdbId}.json`);
-    const meta = metaResponse.data?.meta;
+    const response = await axios.get(movixUrl, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+      },
+      timeout: 7000
+    });
  
-    if (!meta) {
-      console.log("[ERREUR] Impossible de récupérer les métadonnées Cinemeta.");
+    const $ = cheerio.load(response.data);
+    const metas = [];
+ 
+    // On parcourt les cartes de films/séries sur la page de Movix
+    // (Ajuste les sélecteurs '.card', '.poster', 'a' selon la structure HTML exacte)
+    $(".card, article, .movie-item, .item").each((index, element) => {
+      const title = $(element).find(".title, h2, h3, .name").text().trim();
+      const poster = $(element).find("img").attr("src") || $(element).find("img").attr("data-src");
+      const link = $(element).find("a").attr("href") || "";
+ 
+      // Extraction de l'ID TMDb depuis l'URL de la carte (ex: /watch/tv/95557 ou /watch/movie/12345)
+      const tmdbMatch = link.match(/\/(movie|tv)\/(\d+)/);
+      const tmdbId = tmdbMatch ? tmdbMatch[2] : null;
+ 
+      if (title && tmdbId) {
+        metas.push({
+          id: `tmdb:${tmdbId}`, // Format compréhensible par Stremio
+          type: args.type,
+          name: title,
+          poster: poster && poster.startsWith("//") ? "https:" + poster : poster,
+          description: `Disponible sur Movix.cloud`
+        });
+      }
+    });
+ 
+    console.log(`[CATALOGUE] ${metas.length} éléments trouvés sur Movix.`);
+    return { metas };
+ 
+  } catch (error) {
+    console.error("[ERREUR CATALOGUE EXCLUSIF] :", error.message);
+    return { metas: [] };
+  }
+});
+ 
+// 2. GESTION DES FLUX VIDÉO (Stream Handler)
+builder.defineStreamHandler(async (args) => {
+  console.log(`[STREAM] Demande reçue : ${args.type} (${args.id})`);
+ 
+  try {
+    let tmdbId = null;
+    let season = "1";
+    let episode = "1";
+ 
+    // Si l'élément vient de notre catalogue Movix (ID au format tmdb:12345)
+    if (args.id.startsWith("tmdb:")) {
+      const parts = args.id.replace("tmdb:", "").split(":");
+      tmdbId = parts[0];
+      season = parts[1] || "1";
+      episode = parts[2] || "1";
+    } else {
+      // Si l'élément vient de la recherche standard IMDb (tt1234567)
+      const idParts = args.id.split(":");
+      const imdbId = idParts[0];
+      season = idParts[1] || "1";
+      episode = idParts[2] || "1";
+ 
+      const metaResponse = await axios.get(`https://v3-cinemeta.strem.fun/meta/${args.type}/${imdbId}.json`);
+      const meta = metaResponse.data?.meta;
+      if (meta) {
+        tmdbId = meta.moviedb_id || meta.id;
+      }
+    }
+ 
+    if (!tmdbId) {
       return { streams: [] };
     }
  
-    // Cinemeta fournit souvent l'ID TMDb dans l'objet "moviedb_id"
-    const tmdbId = meta.moviedb_id || meta.id;
-    const title = meta.name;
+    let targetUrl = args.type === "series"
+      ? `https://movix.cloud/watch/tv/${tmdbId}/s/${season}/e/${episode}`
+      : `https://movix.cloud/watch/movie/${tmdbId}`;
  
-    console.log(`[MÉDIA] "${title}" | TMDb ID: ${tmdbId} | Type: ${args.type}`);
+    console.log(`[CIBLE] URL du lecteur : ${targetUrl}`);
  
-    // 3. Construction de l'URL exacte selon la structure de Movix.cloud
-    let targetUrl = "";
- 
-    if (args.type === "series") {
-      // Structure exacte : movix.cloud/watch/tv/{tmdb_id}/s/{saison}/e/{episode}
-      targetUrl = `https://movix.cloud/watch/tv/${tmdbId}/s/${season}/e/${episode}`;
-    } else {
-      // Structure exacte pour les films : movix.cloud/watch/movie/{tmdb_id}
-      targetUrl = `https://movix.cloud/watch/movie/${tmdbId}`;
-    }
- 
-    console.log(`[CIBLE] Ouverture de l'URL : ${targetUrl}`);
- 
-    // 4. Chargement de la page web
     const pageResponse = await axios.get(targetUrl, {
       headers: {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Referer": "https://movix.cloud/"
       },
-      timeout: 7000
+      timeout: 8000
     });
  
-    // 5. Extraction du lecteur vidéo (Iframe / Video / Embed)
     const $ = cheerio.load(pageResponse.data);
-    let streamUrl = $("iframe#player").attr("src") ||
-                    $("iframe").attr("src") ||
+ 
+    let streamUrl = $("iframe").attr("src") ||
                     $("video source").attr("src") ||
-                    $("#iframe-embed").attr("src");
+                    $("[data-src]").attr("data-src");
+ 
+    const streams = [];
  
     if (streamUrl) {
       if (streamUrl.startsWith("//")) streamUrl = "https:" + streamUrl;
  
-      const displayTitle = args.type === "series"
-        ? `🎬 ${title} - S${season}E${episode} [HTTP]`
-        : `🎬 ${title} [HTTP]`;
- 
-      return {
-        streams: [
-          {
-            name: "Movix.cloud",
-            title: displayTitle,
-            url: streamUrl
-          }
-        ]
-      };
+      streams.push({
+        name: "Movix.cloud",
+        title: `🎬 Stream Direct [HTTP]`,
+        url: streamUrl
+      });
     } else {
-      console.log("[ERREUR] Aucun lecteur vidéo (iframe) trouvé sur la page.");
+      streams.push({
+        name: "Movix.cloud",
+        title: `⚠️ Ouvrir la page Movix.cloud`,
+        externalUrl: targetUrl
+      });
     }
  
-  } catch (error) {
-    console.error(`[ERREUR ROUTE] Impossible de charger ${error.config?.url || 'URL'} :`, error.message);
-  }
+    return { streams };
  
-  return { streams: [] };
+  } catch (error) {
+    console.error(`[ERREUR STREAM] :`, error.message);
+    return { streams: [] };
+  }
 });
  
 serveHTTP(builder.getInterface(), { port: PORT });
-console.log(`Addon démarré sur le port ${PORT}`);
+console.log(`Addon prêt avec Catalogue 100% Movix sur le port ${PORT}`);
