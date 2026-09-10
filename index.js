@@ -11,7 +11,7 @@ const builder = new addonBuilder({
   description: "Récupère les flux directs depuis Movix.cloud",
   resources: ["stream"],
   types: ["movie", "series"],
-  idPrefixes: ["tt"]
+  idPrefixes: ["tt"],
   catalogs:[]
 });
  
