@@ -12,6 +12,7 @@ const builder = new addonBuilder({
   resources: ["stream"],
   types: ["movie", "series"],
   idPrefixes: ["tt"]
+  catalogs:[]
 });
  
 builder.defineStreamHandler(async (args) => {
